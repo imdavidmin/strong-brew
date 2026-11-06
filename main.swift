@@ -1,5 +1,6 @@
 import AppKit
 import IOKit.ps
+import IOKit.pwr_mgt
 import ServiceManagement
 
 // Closing the lid on battery forces sleep regardless of power assertions;
@@ -42,6 +43,25 @@ enum Power {
         /bin/mv \(tmp) \(sudoersPath)
         """
         return runAsAdmin(script)
+    }
+
+    /// `disablesleep` stops system sleep but not idle display sleep, which turns the
+    /// screen off and locks it. A display assertion (like `caffeinate -d`) covers
+    /// that; it needs no root and is released automatically if the app exits.
+    private static var displayAssertion: IOPMAssertionID = 0
+
+    static func setDisplayAwake(_ on: Bool) {
+        if on, displayAssertion == 0 {
+            var id: IOPMAssertionID = 0
+            let result = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Strong Brew keep awake" as CFString, &id)
+            if result == kIOReturnSuccess { displayAssertion = id }
+        } else if !on, displayAssertion != 0 {
+            IOPMAssertionRelease(displayAssertion)
+            displayAssertion = 0
+        }
     }
 
     /// Internal battery charge and whether the Mac is currently running from it.
@@ -88,7 +108,9 @@ enum Power {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
-    private var awake = false
+    private var awake = false {
+        didSet { syncDisplay() }
+    }
     private var deadline: Date?
     private var checkTimer: Timer?
 
@@ -98,6 +120,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ]
     private static let batteryLevels = [5, 10, 15, 20]
     private static let batteryKey = "batteryThreshold"
+    private static let displayKey = "keepDisplayOn"
+
+    /// Defaults to on: without it the screen turns off and locks while "awake".
+    private var keepDisplayOn: Bool {
+        get { UserDefaults.standard.object(forKey: Self.displayKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: Self.displayKey); syncDisplay() }
+    }
+
+    private func syncDisplay() {
+        Power.setDisplayAwake(awake && keepDisplayOn)
+    }
 
     /// 0 means "never".
     private var batteryThreshold: Int {
@@ -187,6 +220,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             batteryMenu.addItem(item)
         }
         addSubmenu("Off at Battery", batteryMenu)
+        addItem("Keep Display On", #selector(toggleKeepDisplayOn))
+        menu.items.last?.state = keepDisplayOn ? .on : .off
         menu.addItem(.separator())
 
         addItem("Launch at Login", #selector(toggleLaunchAtLogin))
@@ -246,6 +281,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if sender.tag != 0 && !ensureHelperForAutoOff() { return }
         batteryThreshold = sender.tag
         checkAutoOff()
+    }
+
+    @objc private func toggleKeepDisplayOn() {
+        keepDisplayOn.toggle()
     }
 
     @objc private func toggleLaunchAtLogin() {
